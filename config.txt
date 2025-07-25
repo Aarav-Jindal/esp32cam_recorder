@@ -1,7 +1,6 @@
-# astro long-exposure preset
-exposure   = 1.3      # seconds
-gain       = 30       # analogue ≈128×
+exposure   = 1.3
+gain       = 30
 brightness = 0
-framerate  = 2        # aligns with 1.3-s shutter
-duration   = 60      # 5-minute grab
+framerate  = 1
+duration   = 60
 resolution = SVGA

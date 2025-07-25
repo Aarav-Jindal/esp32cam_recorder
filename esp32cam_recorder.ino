@@ -1,9 +1,11 @@
-/*  esp32cam_recorder.ino  –  rev-C (HD option, static helpers)  July 2025
-    ------------------------------------------------------------
-    • Reads /config.txt (exposure, gain, brightness, fps, duration, resolution)
-    • MJPEG-AVI with idx1 (opens silently in FFmpeg / VLC)
-    • Default QVGA @15 fps;  set  resolution=HD   for 1280×720 @5 fps
-    ------------------------------------------------------------*/
+/*  ESP32-CAM long-exposure recorder – rev E5  (Aug 2025)
+    ------------------------------------------------------
+    • Manual 1.3 s shutter, 128× analogue gain
+    • SVGA 800×600 JPEG, 1 fps, 2 frame-buffers
+    • AVI header written twice + patched after EVERY frame
+    • Survives power loss (no 228-byte files)
+    • Settings overridable via /config.txt on the SD card
+*/
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -12,28 +14,32 @@
 #include <SD_MMC.h>
 #include <esp_camera.h>
 
-/* ───────── Status LED ───────── */
-#define PIN_STATUS_REC 33     // on-board white LED
-
-struct ResInfo;
-/* ───────── Config structure ───────── */
+/* ───────── types visible to auto-prototypes ───────── */
+struct ResInfo { framesize_t fs; uint16_t w, h; };
 struct RecSettings {
-  float   exposure   = 0.5f;
-  uint8_t gain       = 5;
+  float   exposure   = 1.3f;
+  uint8_t gain       = 30;
   int8_t  brightness = 0;
-  uint8_t fps        = 15;
-  uint32_t duration  = 60;
-  String  res        = "QVGA";
+  uint8_t fps        = 1;
+  uint32_t duration  = 300;
+  String  res        = "SVGA";
 };
 
-/* ───────── Disable Wi-Fi / BT ───────── */
-static void disableWireless() {
-  btStop();
-  WiFi.mode(WIFI_OFF);
-  esp_wifi_stop();
-}
+/* ───────── forward declarations ───────── */
+static void     disableWireless();
+static bool     readConfig(RecSettings&);
+static ResInfo  resFromString(const String&);
+static String   nextFilename();
+static bool     initCamera(const RecSettings&, uint16_t&, uint16_t&, framesize_t&);
+static bool     recordClip(const RecSettings&);
 
-/* ───────── INI reader ───────── */
+/* ───────── status LED ───────── */
+#define PIN_STATUS_REC 33    // on-board white LED
+
+/* ───────── disable Wi-Fi / BT ───────── */
+static void disableWireless() { btStop(); WiFi.mode(WIFI_OFF); esp_wifi_stop(); }
+
+/* ───────── read /config.txt (optional) ───────── */
 static bool readConfig(RecSettings &cfg) {
   File f = SD_MMC.open("/config.txt", "r");
   if (!f) return false;
@@ -53,20 +59,14 @@ static bool readConfig(RecSettings &cfg) {
   f.close(); return true;
 }
 
-/* ───────── Resolution helper ───────── */
-struct ResInfo { framesize_t fs; uint16_t w, h; };   // ①  <— must come first
-
-static ResInfo resFromString(const String &k) {      // ②  now the type is known
-  if (k.equalsIgnoreCase("HD"))   return {FRAMESIZE_HD ,1280, 720};
+/* ───────── map resolution string → frame-size enum ───────── */
+static ResInfo resFromString(const String &k) {
   if (k.equalsIgnoreCase("SVGA")) return {FRAMESIZE_SVGA, 800, 600};
-  if (k.equalsIgnoreCase("XGA"))  return {FRAMESIZE_XGA ,1024, 768};
-  if (k.equalsIgnoreCase("SXGA")) return {FRAMESIZE_SXGA,1280,1024};
-  if (k.equalsIgnoreCase("UXGA")) return {FRAMESIZE_UXGA,1600,1200};
   if (k.equalsIgnoreCase("VGA"))  return {FRAMESIZE_VGA , 640, 480};
-  return                          {FRAMESIZE_QVGA,      320, 240};
+  return                           {FRAMESIZE_QVGA,     320, 240};
 }
 
-/* ───────── Compact MJPEG-AVI writer ───────── */
+/* ───────── compact MJPEG-AVI writer ───────── */
 class AviWriter {
   File     f;
   uint32_t moviStart = 0;
@@ -109,22 +109,16 @@ bool AviWriter::begin(File file, uint16_t fps, uint16_t w, uint16_t h) {
 
   hdr.us_pf = uspf; hdr.max_bps = 1024*1024;
   hdr.w = hdr.rcR = width; hdr.h = hdr.rcB = height;
-  hdr.scale = uspf; hdr.rate = 1'000'000;
-  hdr.bi_w = width; hdr.bi_h = height;
+  hdr.scale = uspf; hdr.rate  = 1'000'000;
+  hdr.bi_w  = width; hdr.bi_h = height;
 
-  f.write((uint8_t*)&hdr, sizeof(hdr));
+  /* write header twice (redundancy) */
+  f.write((uint8_t*)&hdr, sizeof(hdr)); f.flush();
+  f.write((uint8_t*)&hdr, sizeof(hdr)); f.flush();
+
   moviStart = f.position();
   return true;
 }
-
-void AviWriter::addFrame(const uint8_t *buf, uint32_t len) {
-  static const uint8_t tag_00dc[4] = {'0','0','d','c'};
-  f.write(tag_00dc,4); f.write((uint8_t*)&len,4);
-  f.write(buf,len); if(len&1) f.write((uint8_t)0);
-  frames++; if((frames&0x07)==0) patch();
-}
-
-void AviWriter::end() { patch(); writeIdx(); }
 
 void AviWriter::patch() {
   uint32_t fs = f.size(), movi = fs - moviStart;
@@ -135,10 +129,17 @@ void AviWriter::patch() {
   f.flush();
 }
 
+void AviWriter::addFrame(const uint8_t *buf, uint32_t len) {
+  static const uint8_t tag[4]={'0','0','d','c'};
+  f.write(tag,4); f.write((uint8_t*)&len,4);
+  f.write(buf,len); if(len&1) f.write((uint8_t)0);
+  frames++; patch();                 // patch EVERY frame
+}
+
 void AviWriter::writeIdx() {
   uint32_t idx_sz = frames*16;
-  static const uint8_t tag_idx1[4] = {'i','d','x','1'};
-  static const uint8_t tag_00dc[4] = {'0','0','d','c'};
+  static const uint8_t tag_idx1[4]={'i','d','x','1'};
+  static const uint8_t tag_00dc[4]={'0','0','d','c'};
   f.write(tag_idx1,4); f.write((uint8_t*)&idx_sz,4);
 
   uint32_t off = moviStart + 4;
@@ -153,7 +154,9 @@ void AviWriter::writeIdx() {
   f.flush();
 }
 
-/* ───────── Camera init ───────── */
+void AviWriter::end() { patch(); writeIdx(); }
+
+/* ---------- camera init ---------- */
 static bool initCamera(const RecSettings &cfg,
                        uint16_t &w, uint16_t &h, framesize_t &fs)
 {
@@ -168,33 +171,41 @@ static bool initCamera(const RecSettings &cfg,
     .pin_vsync=25,.pin_href=23,.pin_pclk=22,
     .xclk_freq_hz=20'000'000,
     .pixel_format=PIXFORMAT_JPEG,
-    .frame_size=FRAMESIZE_SVGA,
+    .frame_size=fs,
     .jpeg_quality=15,
     .fb_count=2
   };
   if (esp_camera_init(&c)!=ESP_OK) return false;
 
   sensor_t *s = esp_camera_sensor_get();
-  s->set_gain_ctrl(s,0); s->set_aec2(s,0);
-  s->set_agc_gain(s,cfg.gain);
-  s->set_brightness(s,cfg.brightness);
-  s->set_exposure_ctrl(s,0);
-  uint32_t shut = constrain((uint32_t)(cfg.exposure*1200),100U,600U);
-  s->set_aec_value(s, shut);
+  s->set_whitebal   (s, 0);
+  s->set_awb_gain   (s, 0);
+  s->set_gain_ctrl  (s, 0);
+  s->set_exposure_ctrl(s, 0);
+  s->set_aec2       (s, 0);
+  s->set_ae_level   (s, 0);
+  s->set_aec_value  (s, 0xFFF0);          // ~1.3 s
+  s->set_gainceiling(s, GAINCEILING_128X);
+  s->set_agc_gain   (s, cfg.gain);
+  s->set_brightness (s, cfg.brightness);
+  /* stay in JPEG mode — do NOT call set_pixformat */
   return true;
 }
 
-/* ───────── Filename helper ───────── */
+/* ---------- filename helper ---------- */
 static String nextFilename() {
   char buf[24]; uint16_t idx=1;
-  while(true){ sprintf(buf,"/recording_%04u.avi",idx);
-    if(!SD_MMC.exists(buf)) return String(buf); idx++; }
+  while(true){
+    sprintf(buf,"/recording_%04u.avi",idx);
+    if(!SD_MMC.exists(buf)) return String(buf);
+    idx++;
+  }
 }
 
-/* ───────── Record one clip ───────── */
+/* ---------- record one clip ---------- */
 static bool recordClip(const RecSettings &cfg) {
   uint16_t w,h; framesize_t fs;
-  if(!initCamera(cfg,w,h,fs)) { Serial.println("Camera init failed"); return false; }
+  if(!initCamera(cfg,w,h,fs)){ Serial.println("Cam init failed"); return false; }
 
   File vf = SD_MMC.open(nextFilename(), FILE_WRITE);
   if(!vf){ Serial.println("Open file failed"); return false; }
@@ -202,7 +213,7 @@ static bool recordClip(const RecSettings &cfg) {
   AviWriter avi;
   if(!avi.begin(vf,cfg.fps,w,h)){ Serial.println("AVI begin failed"); return false; }
 
-  Serial.println("Camera OK, recording…");
+  Serial.println("Recording…");
   digitalWrite(PIN_STATUS_REC, HIGH);
 
   uint32_t start=millis(), frameInt=1000UL/cfg.fps;
@@ -213,38 +224,27 @@ static bool recordClip(const RecSettings &cfg) {
     uint32_t spent = millis()-t0; if(spent<frameInt) delay(frameInt-spent);
   }
 
-  avi.end(); vf.close();
+  avi.end(); vf.flush(); delay(50);   // insure last sector written
+  vf.close();
   digitalWrite(PIN_STATUS_REC, LOW);
   esp_camera_deinit();
   Serial.println("Clip finished ✅");
   return true;
 }
 
-/* Config */
-//const RecSettings CFG = {
-//  .exposure   = 1.3f,     // seconds
-//  .gain       = 30,       // analogue ≈128×
-//  .brightness = 0,
-//  .fps        = 2,
-//  .duration   = 300,      // seconds
-//  .res        = "SVGA"    // 800 × 600
-//};
-
-/* ───────── Arduino skeleton ───────── */
+/* ---------- Arduino skeleton ---------- */
 void setup() {
   Serial.begin(115200);
   pinMode(PIN_STATUS_REC, OUTPUT); digitalWrite(PIN_STATUS_REC, LOW);
   disableWireless();
 
-  if(!SD_MMC.begin()){ Serial.println("SD card init failed"); return; }
-  Serial.println("[ESP32-CAM Recorder – revC]  SD card mounted");
+  if(!SD_MMC.begin()){ Serial.println("SD init failed"); return; }
+  Serial.println("[ESP32-CAM Recorder – revE5] SD OK");
 
   RecSettings cfg; readConfig(cfg);
-  Serial.printf("exp=%.2fs gain=%d bright=%d fps=%d dur=%us res=%s\n",
-                cfg.exposure,cfg.gain,cfg.brightness,cfg.fps,cfg.duration,
-                cfg.res.c_str());
+  Serial.printf("exp=%.2fs gain=%d fps=%d dur=%us res=%s\n",
+                cfg.exposure,cfg.gain,cfg.fps,cfg.duration,cfg.res.c_str());
 
   recordClip(cfg);
 }
-
-void loop() { /* one clip per boot */ }
+void loop(){}
