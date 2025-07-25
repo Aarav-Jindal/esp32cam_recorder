@@ -168,8 +168,8 @@ static bool initCamera(const RecSettings &cfg,
     .pin_vsync=25,.pin_href=23,.pin_pclk=22,
     .xclk_freq_hz=20'000'000,
     .pixel_format=PIXFORMAT_JPEG,
-    .frame_size=FRAMESIZE_HD,
-    .jpeg_quality=12,
+    .frame_size=FRAMESIZE_SVGA,
+    .jpeg_quality=15,
     .fb_count=2
   };
   if (esp_camera_init(&c)!=ESP_OK) return false;
@@ -219,6 +219,16 @@ static bool recordClip(const RecSettings &cfg) {
   Serial.println("Clip finished ✅");
   return true;
 }
+
+/* Config */
+//const RecSettings CFG = {
+//  .exposure   = 1.3f,     // seconds
+//  .gain       = 30,       // analogue ≈128×
+//  .brightness = 0,
+//  .fps        = 2,
+//  .duration   = 300,      // seconds
+//  .res        = "SVGA"    // 800 × 600
+//};
 
 /* ───────── Arduino skeleton ───────── */
 void setup() {
