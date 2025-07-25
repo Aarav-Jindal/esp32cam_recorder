@@ -1,80 +1,75 @@
-/*
-   esp32cam_recorder.ino  —  July 2025
-   ------------------------------------------------------------
-   ESP32-CAM autonomous video logger
-     • Reads /config.txt (exposure, gain, brightness, fps, duration)
-     • Records sequential MJPEG-AVI files that survive power loss
-     • GPIO1 HIGH while recording; GPIO2 HIGH on unrecoverable error
-     • Wi-Fi + Bluetooth fully disabled for lower current draw
-   Tested with Arduino-ESP32 core 3.0.7
-   ------------------------------------------------------------*/
+/*  esp32cam_recorder.ino – rev‑B (2025‑07‑25)
+    ------------------------------------------------------------
+    • Buffer‑overflow bug fixed (AVI header now 68 bytes)
+    • Status LEDs moved off UART pins (GPIO14/15)
+    • Extra sanity prints so you know each stage succeeded
+*/
 
 #include <Arduino.h>
-#include <WiFi.h>          // for WiFi.mode()
-#include "esp_wifi.h"      // for esp_wifi_stop()
+#include <WiFi.h>
+#include "esp_wifi.h"
 #include <FS.h>
 #include <SD_MMC.h>
 #include <esp_camera.h>
-#include "recorder_config.h"   // INI parser (next file)
+#include "recorder_config.h"
 
 /* -------- GPIO status lines -------- */
-#define PIN_STATUS_REC  1   // GPIO1 – HIGH during recording
-#define PIN_STATUS_ERR  2   // GPIO2 – HIGH on fatal error
+#define PIN_STATUS_REC  14  //  GPIO14 – HIGH during recording
+#define PIN_STATUS_ERR  15  //  GPIO15 – HIGH on fatal error
 
 /* ============================================================
-   Minimal embedded MJPEG-AVI writer
+   Minimal embedded MJPEG‑AVI writer (stack‑safe)
    ============================================================ */
 class AviWriter {
   File     f;
   uint32_t moviStart = 0;
   uint32_t frames    = 0;
-
 public:
-  bool begin(File file, uint16_t fps)
-  {
+  bool begin(File file, uint16_t fps) {
     f = file;
     if (!f) return false;
 
-    /* ---- Build a 64-byte RIFF/AVI header template ---- */
-    uint8_t hdr[64] = {0};
+    /* ---- Build a 68‑byte RIFF/AVI header ---- */
+    uint8_t hdr[68] = {0};
     memcpy(&hdr[0],  "RIFF", 4);
     memcpy(&hdr[8],  "AVI ", 4);
-    memcpy(&hdr[12], "LIST", 4); *reinterpret_cast<uint32_t*>(&hdr[16]) = 0x3C;
+
+    memcpy(&hdr[12], "LIST", 4);
+    *reinterpret_cast<uint32_t*>(&hdr[16]) = 0x3C;   // hdrl chunk size
     memcpy(&hdr[20], "hdrl", 4);
-    memcpy(&hdr[24], "avih", 4); *reinterpret_cast<uint32_t*>(&hdr[28]) = 0x28;
-    uint32_t uspf = 1'000'000UL / fps;
-    *reinterpret_cast<uint32_t*>(&hdr[32]) = uspf;          // µs / frame
-    memcpy(&hdr[44], "\x10\0\0\0", 4);                      // flags = HAS_INDEX
+
+    memcpy(&hdr[24], "avih", 4);
+    *reinterpret_cast<uint32_t*>(&hdr[28]) = 0x28;   // avih size
+    uint32_t uspf = 1'000'000UL / fps;               // µs per frame
+    *reinterpret_cast<uint32_t*>(&hdr[32]) = uspf;
+    memcpy(&hdr[44], "���", 4);            // HAS_INDEX flag
+
+    /* LIST 'movi' stub */
     memcpy(&hdr[56], "LIST", 4);
-    memcpy(&hdr[60], "\0\0\0\0movi", 5);                    // size patched later
+    /* 60‑63 stay 0 (size patched later) */
+    memcpy(&hdr[64], "movi", 4);
 
     f.write(hdr, sizeof(hdr));
     moviStart = f.position();
     return true;
   }
 
-
-
-  void addFrame(const uint8_t *buf, uint32_t len)
-  {
+  void addFrame(const uint8_t *buf, uint32_t len) {
     const uint8_t tag[4] = { '0','0','d','c' };
     f.write(tag, 4);
     f.write((uint8_t*)&len, 4);
     f.write(buf, len);
-    if (len & 1) f.write((uint8_t)0);       // word-align
+    if (len & 1) f.write((uint8_t)0);
 
     frames++;
     if ((frames & 0x0F) == 0) patchHeader();   // every 16 frames
   }
 
   void end() { patchHeader(); f.flush(); }
-
 private:
-  void patchHeader()
-  {
+  void patchHeader() {
     uint32_t fileSize = f.size();
     uint32_t moviSize = fileSize - moviStart;
-
     f.seek(4);  f.write((uint8_t*)&fileSize, 4);   // RIFF size
     f.seek(48); f.write((uint8_t*)&frames, 4);     // total frames
     f.seek(60); f.write((uint8_t*)&moviSize, 4);   // LIST movi size
@@ -83,15 +78,13 @@ private:
 };
 
 /* ------------------------------------------------------------ */
-void disableWireless()
-{
+void disableWireless() {
   btStop();
   WiFi.mode(WIFI_OFF);
   esp_wifi_stop();
 }
 
-String nextFilename()
-{
+String nextFilename() {
   char name[22];
   for (uint16_t idx = 1; ; ++idx) {
     sprintf(name, "/recording_%04u.avi", idx);
@@ -99,19 +92,16 @@ String nextFilename()
   }
 }
 
-bool initCamera(const RecSettings &cfg)
-{
+bool initCamera(const RecSettings &cfg) {
   camera_config_t c = {
     .pin_pwdn     = 32,
     .pin_reset    = -1,
     .pin_xclk     = 0,
     .pin_sscb_sda = 26,
     .pin_sscb_scl = 27,
-
     .pin_d7 = 35, .pin_d6 = 34, .pin_d5 = 39, .pin_d4 = 36,
     .pin_d3 = 21, .pin_d2 = 19, .pin_d1 = 18, .pin_d0 = 5,
     .pin_vsync = 25, .pin_href = 23, .pin_pclk = 22,
-
     .xclk_freq_hz = 20'000'000,
     .pixel_format = PIXFORMAT_JPEG,
     .frame_size   = FRAMESIZE_QVGA,
@@ -127,15 +117,12 @@ bool initCamera(const RecSettings &cfg)
   s->set_brightness(s, cfg.brightness);
   s->set_exposure_ctrl(s, 0);
 
-  uint32_t shutter = constrain((uint32_t)(cfg.exposure * 1200), 100u, 600u);
+  uint32_t shutter = constrain((uint32_t)(cfg.exposure * 1200), 100U, 600U);
   s->set_aec_value(s, shutter);
-
-  /* FPS throttled in software timing loop for compatibility */
-  return true;
+  return true;   // FPS throttled in software
 }
 
-bool recordClip(const RecSettings &cfg)
-{
+bool recordClip(const RecSettings &cfg) {
   File vf = SD_MMC.open(nextFilename(), FILE_WRITE);
   if (!vf) { digitalWrite(PIN_STATUS_ERR, HIGH); return false; }
 
@@ -164,15 +151,15 @@ bool recordClip(const RecSettings &cfg)
 }
 
 /* ---------------- Arduino skeleton ---------------- */
-void setup()
-{
+void setup() {
   pinMode(PIN_STATUS_REC, OUTPUT);
   pinMode(PIN_STATUS_ERR, OUTPUT);
   digitalWrite(PIN_STATUS_REC, LOW);
   digitalWrite(PIN_STATUS_ERR, LOW);
 
   Serial.begin(115200);
-  Serial.println("\n[ESP32-CAM Recorder]");
+  delay(50);                 // give USB time to enumerate
+  Serial.println("[ESP32‑CAM Recorder ‑ revB]");
 
   disableWireless();
 
@@ -181,26 +168,25 @@ void setup()
     digitalWrite(PIN_STATUS_ERR, HIGH);
     return;
   }
+  Serial.println("SD card mounted");
 }
 
-void loop()
-{
-  RecSettings cfg;
-  loadConfig(cfg);                 // parse /config.txt each cycle
-
-  Serial.printf("exp=%.2fs gain=%d bright=%d fps=%d dur=%us\n",
-                cfg.exposure, cfg.gain, cfg.brightness, cfg.fps, cfg.duration);
+void loop() {
+  RecSettings cfg; loadConfig(cfg);
+  Serial.printf("exp=%.2fs gain=%d bright=%d fps=%d dur=%us", cfg.exposure, cfg.gain, cfg.brightness, cfg.fps, cfg.duration);
 
   if (!initCamera(cfg)) {
     Serial.println("Camera init failed");
     digitalWrite(PIN_STATUS_ERR, HIGH);
     while (true) delay(1000);
   }
+  Serial.println("Camera OK, recording…");
 
   if (!recordClip(cfg)) {
     Serial.println("Fatal error – halting");
     while (true) delay(1000);
   }
 
-  delay(2000);    // 2-s gap before the next clip (or edit config & reboot)
+  Serial.println("Clip finished ✅");
+  delay(2000);
 }
