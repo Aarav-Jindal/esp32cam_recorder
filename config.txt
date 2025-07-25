@@ -1,0 +1,7 @@
+# demo settings — edit freely
+exposure   = 0.5     # seconds (0.2 – 1.3)
+gain       = 5
+brightness = 0
+framerate  = 15
+duration   = 60
+resolution = HD       # HD | SVGA | VGA | QVGA …
