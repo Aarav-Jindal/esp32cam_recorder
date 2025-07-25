@@ -21,61 +21,139 @@
    Minimal embedded MJPEG‑AVI writer (stack‑safe)
    ============================================================ */
 class AviWriter {
-  File     f;
-  uint32_t moviStart = 0;
-  uint32_t frames    = 0;
+  File       f;
+  uint32_t   moviStart = 0;
+  uint32_t   frames    = 0;
+  uint16_t   width     = 320, height = 240;   // QVGA default
+  uint32_t   uspf      = 33333;               // 30 fps default
 public:
-  bool begin(File file, uint16_t fps) {
+  bool begin(File file, uint16_t fps,
+             uint16_t w = 320, uint16_t h = 240)
+  {
     f = file;
     if (!f) return false;
 
-    /* ---- Build a 68‑byte RIFF/AVI header ---- */
-    uint8_t hdr[68] = {0};
-    memcpy(&hdr[0],  "RIFF", 4);
-    memcpy(&hdr[8],  "AVI ", 4);
+    width  = w;
+    height = h;
+    uspf   = 1'000'000UL / fps;
 
-    memcpy(&hdr[12], "LIST", 4);
-    *reinterpret_cast<uint32_t*>(&hdr[16]) = 0x3C;   // hdrl chunk size
-    memcpy(&hdr[20], "hdrl", 4);
+    /* ---- Build header ---- */
+    struct  __attribute__((packed)) {
+      char riff_id[4]   = {'R','I','F','F'};
+      uint32_t riff_sz  = 0;              // patched later
+      char riff_ty[4]   = {'A','V','I',' '};
 
-    memcpy(&hdr[24], "avih", 4);
-    *reinterpret_cast<uint32_t*>(&hdr[28]) = 0x28;   // avih size
-    uint32_t uspf = 1'000'000UL / fps;               // µs per frame
-    *reinterpret_cast<uint32_t*>(&hdr[32]) = uspf;
-    memcpy(&hdr[44], "���", 4);            // HAS_INDEX flag
+      char hdrl_id[4]   = {'L','I','S','T'};
+      uint32_t hdrl_sz  = 0xC4;           // fixed
+      char hdrl_ty[4]   = {'h','d','r','l'};
 
-    /* LIST 'movi' stub */
-    memcpy(&hdr[56], "LIST", 4);
-    /* 60‑63 stay 0 (size patched later) */
-    memcpy(&hdr[64], "movi", 4);
+      /* avih */
+      char avih_id[4]   = {'a','v','i','h'};
+      uint32_t avih_sz  = 0x38;
+      uint32_t usec_per_frame;
+      uint32_t max_bytes_per_sec;
+      uint32_t padding = 0;
+      uint32_t flags   = 0x10;            // HAS_INDEX
+      uint32_t total_frames = 0;          // patched
+      uint32_t initial_frames = 0;
+      uint32_t streams = 1;
+      uint32_t buf_suggest = 0;
+      uint32_t w, h;
+      uint32_t reserved[4] = {0};
 
-    f.write(hdr, sizeof(hdr));
+      /* LIST strl */
+      char strl_id[4]  = {'L','I','S','T'};
+      uint32_t strl_sz = 0x7C;
+      char strl_ty[4]  = {'s','t','r','l'};
+
+      /* strh */
+      char strh_id[4]  = {'s','t','r','h'};
+      uint32_t strh_sz = 0x38;
+      char fcc_type[4] = {'v','i','d','s'};
+      char fcc_hdlr[4] = {'M','J','P','G'};
+      uint32_t flags2  = 0;
+      uint16_t priority = 0, language = 0;
+      uint32_t init_frames = 0;
+      uint32_t scale;
+      uint32_t rate;
+      uint32_t start = 0;
+      uint32_t length = 0;                // patched
+      uint32_t buf_suggest2 = 0;
+      uint32_t quality = -1;
+      uint32_t sample_sz = 0;
+      int16_t  rc_left = 0, rc_top = 0, rc_right, rc_bottom;
+
+      /* strf (BITMAPINFOHEADER) */
+      char strf_id[4] = {'s','t','r','f'};
+      uint32_t strf_sz = 0x28;
+      uint32_t bi_size = 40;
+      int32_t  bi_width;
+      int32_t  bi_height;
+      uint16_t bi_planes = 1;
+      uint16_t bi_bitcount = 24;
+      uint32_t bi_compression = 0x47504A4D; // 'MJPG'
+      uint32_t bi_size_image = 0;
+      int32_t  bi_x_ppm = 0, bi_y_ppm = 0;
+      uint32_t bi_clr_used = 0, bi_clr_important = 0;
+
+      /* LIST movi (header only, size patched later) */
+      char movi_id[4] = {'L','I','S','T'};
+      uint32_t movi_sz = 0;               // patched
+      char movi_ty[4] = {'m','o','v','i'};
+    } hdr;
+
+    /* Fill dynamic fields */
+    hdr.usec_per_frame = uspf;
+    hdr.max_bytes_per_sec = 1024 * 1024;          // generous
+    hdr.w = hdr.rc_right = width;
+    hdr.h = hdr.rc_bottom = height;
+    hdr.scale = uspf;
+    hdr.rate  = 1'000'000;
+    hdr.bi_width  = width;
+    hdr.bi_height = height;
+
+    f.write((uint8_t*)&hdr, sizeof(hdr));
     moviStart = f.position();
     return true;
   }
 
-  void addFrame(const uint8_t *buf, uint32_t len) {
-    const uint8_t tag[4] = { '0','0','d','c' };
+  void addFrame(const uint8_t *buf, uint32_t len)
+  {
+    static const uint8_t tag[4] = { '0','0','d','c' };
     f.write(tag, 4);
     f.write((uint8_t*)&len, 4);
     f.write(buf, len);
     if (len & 1) f.write((uint8_t)0);
 
     frames++;
-    if ((frames & 0x0F) == 0) patchHeader();   // every 16 frames
+    if ((frames & 0x07) == 0) patch();    // every 8 frames
   }
 
-  void end() { patchHeader(); f.flush(); }
+  void end() { patch(); }
+
 private:
-  void patchHeader() {
+  void patch()
+  {
     uint32_t fileSize = f.size();
     uint32_t moviSize = fileSize - moviStart;
-    f.seek(4);  f.write((uint8_t*)&fileSize, 4);   // RIFF size
-    f.seek(48); f.write((uint8_t*)&frames, 4);     // total frames
-    f.seek(60); f.write((uint8_t*)&moviSize, 4);   // LIST movi size
+
+    /* RIFF size */
+    f.seek(4);  f.write((uint8_t*)&fileSize, 4);
+
+    /* total frames in avih */
+    f.seek(48); f.write((uint8_t*)&frames, 4);
+
+    /* length in strh */
+    f.seek(140); f.write((uint8_t*)&frames, 4);
+
+    /* LIST movi size */
+    f.seek(moviStart - 8);   // start of 'LIST'
+    f.write((uint8_t*)&moviSize, 4);
+
     f.flush();
   }
 };
+
 
 /* ------------------------------------------------------------ */
 void disableWireless() {
@@ -187,6 +265,7 @@ void loop() {
     while (true) delay(1000);
   }
 
+  esp_camera_deinit();
   Serial.println("Clip finished ✅");
   delay(2000);
 }
